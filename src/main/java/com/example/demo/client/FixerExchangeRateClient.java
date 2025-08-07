@@ -1,67 +1,59 @@
 package com.example.demo.client;
 
+import com.example.demo.dto.fixer.FixerResponse;
 import com.example.demo.excepitons.ExternalServiceException;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
-import java.util.Map;
+import java.math.RoundingMode;
 
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class FixerExchangeRateClient implements ExchangeRateClient {
 
-    private final RestTemplate restTemplate;
-    private final String apiKey;
-    private final String baseUrl;
+    private final RestTemplate restTemplate = new RestTemplate();
 
-    public FixerExchangeRateClient(RestTemplate restTemplate,
-                                   @Value("${fixer.api.key}") String apiKey,
-                                   @Value("${fixer.api.url}") String baseUrl) {
-        this.restTemplate = restTemplate;
-        this.apiKey = apiKey;
-        this.baseUrl = baseUrl;
-    }
+    @Value("${fixer.api.key}")
+    private String apiKey;
 
-    /**
-     * Calls Fixer API to fetch exchange rate.
-     */
+    @Value("${fixer.api.url}")
+    private String fixerUrl;
+
     @Override
-    public BigDecimal getExchangeRate(String from, String to) throws ExternalServiceException {
-        log.debug("Calling external API for rate: {} → {}", from, to);
-        if (from == null || to == null) {
-            throw new ExternalServiceException("Currency codes must not be null.");
-        }
+    public BigDecimal getExchangeRate(String from, String to) {
+        log.debug("Calling external Fixer API for exchange rate: {} → {}", from, to);
 
-        String url = String.format("%s/latest?access_key=%s&base=%s&symbols=%s", baseUrl, apiKey, from, to);
+        // Fixer free tier only supports EUR as base
+        String url = fixerUrl + "?access_key=" + apiKey + "&symbols=" + from + "," + to;
 
         try {
-            ResponseEntity<Map> response = restTemplate.getForEntity(url, Map.class);
-            log.debug("Fixer API response: {}", response.getStatusCode());
-            if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
-                throw new ExternalServiceException("Failed to retrieve exchange rate from external API.");
+            FixerResponse response = restTemplate.getForObject(url, FixerResponse.class);
+
+            if (response == null || !response.isSuccess()) {
+                log.warn("Invalid Fixer API response or success=false");
+                throw new ExternalServiceException("Failed to retrieve rates from Fixer API.");
             }
 
-            Map<String, Object> body = response.getBody();
-            Map<String, Object> rates = (Map<String, Object>) body.get("rates");
+            BigDecimal fromRate = response.getRates().get(from);
+            BigDecimal toRate = response.getRates().get(to);
 
-            if (rates == null || !rates.containsKey(to)) {
-                throw new ExternalServiceException("Target currency not found in response.");
+            if (fromRate == null || toRate == null || fromRate.compareTo(BigDecimal.ZERO) == 0) {
+                log.warn("Invalid rate data received from Fixer: fromRate={}, toRate={}", fromRate, toRate);
+                throw new ExternalServiceException("Invalid currency rate data from Fixer.");
             }
 
-            Object rateValue = rates.get(to);
-            if (rateValue instanceof Number) {
-                log.info("Parsed rate from Fixer API: {} → {} = {}", from, to, rateValue);
-                return BigDecimal.valueOf(((Number) rateValue).doubleValue());
-            } else {
-                throw new ExternalServiceException("Invalid rate value format.");
-            }
+            // Calculate from → to rate via EUR base
+            BigDecimal exchangeRate = toRate.divide(fromRate, 6, RoundingMode.HALF_UP);
+            log.info("Exchange rate {} → {} = {}", from, to, exchangeRate);
+            return exchangeRate;
 
-        } catch (RestClientException e) {
+        } catch (Exception e) {
+            log.error("Error communicating with Fixer API", e);
             throw new ExternalServiceException("Error communicating with external exchange rate service.");
         }
     }
